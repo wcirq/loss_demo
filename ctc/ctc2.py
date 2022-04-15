@@ -1,6 +1,7 @@
 # coding=utf-8
+import glob
+import os
 import time
-
 import cv2
 import tensorflow as tf
 import scipy.io.wavfile as wav
@@ -19,13 +20,15 @@ SPACE_TOKEN = '<space>'
 SPACE_INDEX = 0
 FIRST_INDEX = ord('a') - 1  # 0 is reserved to space
 
+MAX_SEQ_LEN = 300
+
 # mfcc默认提取出来的一帧13个特征
 num_features = 13
 # 26个英文字母 + 1个空白 + 1个no label = 28 label个数
 num_classes = ord('z') - ord('a') + 1 + 1 + 1
 
 # 迭代次数
-num_epochs = 200
+num_epochs = 1000
 # lstm隐藏单元数
 num_hidden = 40
 # 2层lstm网络
@@ -39,6 +42,27 @@ initial_learning_rate = 0.01
 num_examples = 1
 # 一个epoch有多少个batch
 num_batches_per_epoch = int(num_examples / batch_size)
+
+dataset_path = "/home/wcirq/Downloads/AISHELL-1_sample/tiny"
+
+
+def gen_index_file():
+    audio_path = f"{dataset_path}/*.txt"
+    audio_label_list = glob.glob(audio_path)
+    chars = set()
+    for audio_label_path in audio_label_list:
+        with open(audio_label_path, "r") as f:
+            line = f.readline()
+            for l in line:
+                chars.add(l)
+    char_to_index = {c: i for i, c in enumerate(chars)}
+    index_to_char = {i: c for i, c in enumerate(chars)}
+    return char_to_index, index_to_char
+
+
+char_to_index, index_to_char = gen_index_file()
+print("classes", char_to_index)
+num_classes = len(char_to_index) + 1
 
 
 def sparse_tuple_from(sequences, dtype=np.int32):
@@ -62,13 +86,10 @@ def sparse_tuple_from(sequences, dtype=np.int32):
     return indices, values, shape
 
 
-def get_audio_feature():
+def get_audio_feature(audio_filename):
     '''
   获取wav文件提取mfcc特征之后的数据
   '''
-
-    audio_filename = "audio.wav"
-
     # 读取wav文件内容，fs为采样率， audio为数据
     fs, audio = wav.read(audio_filename)
 
@@ -77,47 +98,59 @@ def get_audio_feature():
     # cv2.imshow("mffc", inputs.T)
     # cv2.waitKey(0)
     # 对特征数据进行归一化，减去均值除以方差
-    feature_inputs = inputs[np.newaxis, :]
+    feature_inputs = inputs
     feature_inputs = (feature_inputs - np.mean(feature_inputs)) / np.std(feature_inputs)
 
-
     # 特征数据的序列长度
-    feature_seq_len = [feature_inputs.shape[1]]
+    feature_seq_len = feature_inputs.shape[0]
 
     return feature_inputs, feature_seq_len
 
 
-def get_audio_label():
+def get_audio_label(target_filename):
     '''
   将label文本转换成整数序列，然后再换成稀疏三元组
   '''
-    target_filename = 'label.txt'
 
     with open(target_filename, 'r') as f:
         # 原始文本为“she had your dark suit in greasy wash water all year”
         line = f.readlines()[0].strip()
-        targets = line.replace(' ', '  ')
-        # 放入list中，空格用''代替
-        # ['she', '', 'had', '', 'your', '', 'dark', '', 'suit', '', 'in', '', 'greasy', '', 'wash', '', 'water', '', 'all', '', 'year']
-        targets = targets.split(' ')
+        targets = np.hstack(line)
+        # targets = np.asarray([SPACE_INDEX if x == SPACE_TOKEN else ord(x) - FIRST_INDEX for x in targets])
+        targets = np.asarray([char_to_index.get(x, 0) for x in targets])
+        if len(targets) > 15:
+            targets = targets[:15]
+        else:
+            pad = 15 - len(targets)
+            targets = np.concatenate((targets, np.zeros((pad,), dtype=np.int64)))
+    return targets
 
-        # 每个字母作为一个label,转换成如下：
-        # ['s' 'h' 'e' '<space>' 'h' 'a' 'd' '<space>' 'y' 'o' 'u' 'r' '<space>' 'd'
-        # 'a' 'r' 'k' '<space>' 's' 'u' 'i' 't' '<space>' 'i' 'n' '<space>' 'g' 'r'
-        # 'e' 'a' 's' 'y' '<space>' 'w' 'a' 's' 'h' '<space>' 'w' 'a' 't' 'e' 'r'
-        # '<space>' 'a' 'l' 'l' '<space>' 'y' 'e' 'a' 'r']
-        targets = np.hstack([SPACE_TOKEN if x == '' else list(x) for x in targets])
 
-        # 将label转换成整数序列表示:
-        # [19  8  5  0  8  1  4  0 25 15 21 18  0  4  1 18 11  0 19 21  9 20  0  9 14
-        # 0  7 18  5  1 19 25  0 23  1 19  8  0 23  1 20  5 18  0  1 12 12  0 25  5
-        # 1 18]
-        targets = np.asarray([SPACE_INDEX if x == SPACE_TOKEN else ord(x) - FIRST_INDEX
-                              for x in targets])
+def get_batch_data(batch_size):
+    audio_path = f"{dataset_path}/*.wav"
+    audio_file_list = glob.glob(audio_path)
+    need_list = np.random.choice(audio_file_list, batch_size)
+    train_inputs = []
+    train_seq_len = []
+    train_targets = []
+    for audio_name in need_list:
+        label_name = os.path.splitext(audio_name)[0] + ".txt"
+        audio_path = os.path.join(audio_path, audio_name)
+        feature_input, seq_len = get_audio_feature(audio_path)
+        if MAX_SEQ_LEN < seq_len:
+            feature_input = feature_input[:MAX_SEQ_LEN, :]
+        else:
+            pad = MAX_SEQ_LEN - feature_input.shape[0]
+            feature_input = np.vstack((feature_input, np.zeros((pad, feature_input.shape[1]), dtype=np.float)))
 
-        # 将列表转换成稀疏三元组
-        train_targets = sparse_tuple_from([targets])
-    return train_targets
+        targets = get_audio_label(label_name)
+        train_inputs.append(feature_input)
+        train_seq_len.append(MAX_SEQ_LEN)
+        train_targets.append(targets)
+
+    train_targets = sparse_tuple_from(train_targets)
+
+    return np.array(train_inputs), train_seq_len, train_targets
 
 
 def inference(inputs, seq_len):
@@ -228,20 +261,16 @@ def main():
     with tf.Session(config=config) as session:
         # 初始化变量
         tf.global_variables_initializer().run()
-
-        # 获取训练数据，本例中只去一个样本的训练数据
-        train_inputs, train_seq_len = get_audio_feature()
-        # 获取这个样本的label
-        train_targets = get_audio_label()
-        feed = {inputs: train_inputs,
-                targets: train_targets,
-                seq_len: train_seq_len}
-
         for curr_epoch in range(num_epochs):
             train_cost = train_ler = 0
             start = time.time()
 
             for batch in range(num_batches_per_epoch):
+                # 获取训练数据
+                train_inputs, train_seq_len, train_targets = get_batch_data(5)
+                feed = {inputs: train_inputs,
+                        targets: train_targets,
+                        seq_len: train_seq_len}
                 # 一次训练，更新参数
                 batch_cost, _ = session.run([cost, optimizer], feed)
                 # 计算累加的训练的损失值
@@ -253,25 +282,39 @@ def main():
             train_ler /= num_examples
 
             # 打印每一轮迭代的损失值，错误率
-            log = "Epoch {}/{}, train_cost = {:.3f}, train_ler = {:.3f}, time = {:.3f}"
+            log = "\rEpoch {}/{}, train_cost = {:.3f}, train_ler = {:.3f}, time = {:.3f}"
             print(log.format(curr_epoch + 1, num_epochs, train_cost, train_ler,
-                             time.time() - start))
+                             time.time() - start), end="")
+
+            if curr_epoch % 50 == 0:
+                # 读取测试数据，这里读取的和训练数据的同一个样本
+                test_inputs, test_seq_len, test_targets = get_batch_data(1)
+                test_feed = {inputs: test_inputs,
+                             targets: test_targets,
+                             seq_len: test_seq_len}
+                d = session.run(decoded[0], feed_dict=test_feed)
+                # 将得到的测试语音经过ctc解码后的整数序列转换成字母
+                str_decoded = ''.join([index_to_char[x] for x in np.asarray(d[1])])
+                src_decoded = ''.join([index_to_char[x] for x in test_targets[1]])
+                # 打印最后的结果
+                print('Sourc:\n%s' % src_decoded)
+                print('Decoded:\n%s' % str_decoded)
+                print()
         # 在进行了1200次训练之后，计算一次实际的测试，并且输出
-        # 读取测试数据，这里读取的和训练数据的同一个样本
-        test_inputs, test_seq_len = get_audio_feature()
-        test_targets = get_audio_label()
-        test_feed = {inputs: test_inputs,
-                     targets: test_targets,
-                     seq_len: test_seq_len}
-        d = session.run(decoded[0], feed_dict=test_feed)
-        # 将得到的测试语音经过ctc解码后的整数序列转换成字母
-        str_decoded = ''.join([chr(x) for x in np.asarray(d[1]) + FIRST_INDEX])
-        # 将no label转换成空
-        str_decoded = str_decoded.replace(chr(ord('z') + 1), '')
-        # 将空白转换成空格
-        str_decoded = str_decoded.replace(chr(ord('a') - 1), ' ')
-        # 打印最后的结果
-        print('Decoded:\n%s' % str_decoded)
+        for i in range(5):
+            # 读取测试数据，这里读取的和训练数据的同一个样本
+            test_inputs, test_seq_len, test_targets = get_batch_data(1)
+            test_feed = {inputs: test_inputs,
+                         targets: test_targets,
+                         seq_len: test_seq_len}
+            d = session.run(decoded[0], feed_dict=test_feed)
+            # 将得到的测试语音经过ctc解码后的整数序列转换成字母
+            str_decoded = ''.join([index_to_char[x] for x in np.asarray(d[1])])
+            src_decoded = ''.join([index_to_char[x] for x in test_targets[1]])
+            # 打印最后的结果
+            print('Sourc:\n%s' % src_decoded)
+            print('Decoded:\n%s' % str_decoded)
+            print()
 
 
 if __name__ == "__main__":
