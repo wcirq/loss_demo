@@ -36,7 +36,7 @@ num_layers = 1
 # batch_size设置为1
 batch_size = 1
 # 初始学习率
-initial_learning_rate = 0.01
+initial_learning_rate = 0.008
 
 # 样本个数
 num_examples = 1
@@ -108,9 +108,9 @@ def get_audio_feature(audio_filename):
 
 
 def get_audio_label(target_filename):
-    '''
+    """
   将label文本转换成整数序列，然后再换成稀疏三元组
-  '''
+  """
 
     with open(target_filename, 'r') as f:
         # 原始文本为“she had your dark suit in greasy wash water all year”
