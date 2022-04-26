@@ -4,7 +4,10 @@
 # @Author wcy
 # @Software: PyCharm
 # @Site
+import os
 import time
+from copy import copy
+from glob import glob
 
 import cv2
 import numpy as np
@@ -61,15 +64,19 @@ def sift():
     cv2.destroyAllWindows()
 
 
-def get_homo(img1, img2, dtype="sift", ransacReprojThreshold=5.0):
+def get_homo(img1, img2, dtype="ORB_create", ransacReprojThreshold=5.0, only_affine=False):
+    mask1 = np.ones((img1.shape[0], img1.shape[1]), dtype=np.uint8)
+    mask1[:int(img1.shape[0] * 0.6), :] = 0
+    mask2 = np.ones((img2.shape[0], img2.shape[1]), dtype=np.uint8)
+    mask2[int(mask2.shape[0] * 0.4):, :] = 0
     if dtype == "sift":
         # 创建特征转换对象
         sift = cv2.xfeatures2d.SIFT_create()
         start = time.time()
         # 获取特征点和描述子
-        k1, d1 = sift.detectAndCompute(img1, None)
-        k2, d2 = sift.detectAndCompute(img2, None)
-        # print("sift", time.time() - start)
+        k1, d1 = sift.detectAndCompute(img1, mask1)
+        k2, d2 = sift.detectAndCompute(img2, mask2)
+        print("sift", time.time() - start)
         """
         k1 k2是关键点。它所包含的信息有：
         angle：角度，表示关键点的方向，为了保证方向不变形，SIFT算法通过对关键点周围邻域进行梯度运算，求得该点方向。-1为初值。
@@ -81,12 +88,17 @@ def get_homo(img1, img2, dtype="sift", ransacReprojThreshold=5.0):
         """
     elif dtype == "surf":
         # pip install opencv-contrib-python==3.4.2.17
-        surf = cv2.xfeatures2d.SURF_create(400)
+        surf = cv2.xfeatures2d.SURF_create()
         start = time.time()
-        # 找到关键点和描述符
-        k1, d1 = surf.detectAndCompute(img1, None)
-        k2, d2 = surf.detectAndCompute(img2, None)
-        # print("surf", time.time() - start)
+        k1, d1 = surf.detectAndCompute(img1, mask1)
+        k2, d2 = surf.detectAndCompute(img2, mask2)
+        print("surf", time.time() - start)
+    else:
+        start = time.time()
+        orb = cv2.ORB_create(nfeatures=128)
+        k1, d1 = orb.detectAndCompute(img1, mask1)
+        k2, d2 = orb.detectAndCompute(img2, mask2)
+        print("orb", time.time() - start)
     # 创建特征匹配器
     bf = cv2.BFMatcher()
     # 使用描述子进行一对多的描述子匹配
@@ -104,7 +116,7 @@ def get_homo(img1, img2, dtype="sift", ransacReprojThreshold=5.0):
     # 筛选有效的特征描述子存入数组中
     verify_matches = []
     for m1, m2 in maches:
-        if m1.distance / m2.distance < 0.8:
+        if m1.distance / m2.distance < 0.9:
             verify_matches.append([m1])
     # 单应性矩阵需要最低四个特征描述子坐标点进行计算，判断数组中是否有足够,这里设为6更加充足
     if len(verify_matches) > 6:
@@ -119,19 +131,28 @@ def get_homo(img1, img2, dtype="sift", ransacReprojThreshold=5.0):
         # 计算需要的坐标格式：[[x1,y1],[x2,y2],....]所以需要转化
         img1_pts = np.array(img1_pts).reshape(-1, 1, 2)
         img2_pts = np.array(img2_pts).reshape(-1, 1, 2)
-        # 计算单应性矩阵用来优化特征点
-        H, mask = cv2.findHomography(img1_pts, img2_pts, cv2.RANSAC, ransacReprojThreshold=ransacReprojThreshold)
-        drawpara = dict(singlePointColor=None, matchColor=None, flags=2)
-        img = cv2.drawMatchesKnn(img1, k1, img2, k2, verify_matches, None, **drawpara)
 
-        # 仅保留平移和旋转
-        # H[2:, :] = np.array([[0, 0, 1]])
+        # 计算单应性矩阵用来优化特征点
+        H, mask = cv2.findHomography(img1_pts, img2_pts, cv2.RANSAC, ransacReprojThreshold=ransacReprojThreshold,
+                                     maxIters=3000)
+
+        img1 = (img1 * np.tile((mask1 + (1 - mask1) * 0.5)[:, :, None], (1, 1, 3))).astype(np.uint8)
+        img2 = (img2 * np.tile((mask2 + (1 - mask2) * 0.5)[:, :, None], (1, 1, 3))).astype(np.uint8)
+
+        verify_matches = [verify_matches[i] for i, m in enumerate(mask) if m[0] == 1]
+        drawpara = dict(singlePointColor=None, matchColor=(0, 255, 0), matchesMask=None,
+                        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+        img = cv2.drawMatchesKnn(img1, k1, img2, k2, verify_matches, None, **drawpara)
+        if only_affine:
+            # 仅保留平移和旋转
+            H[2:, :] = np.array([[0, 0, 1]])
         return H, img
     else:
         return None, None
 
 
-def stitch_image(img1, img2, H):
+def stitch_image(img1, img2, H, blend=True):
     # 1、获得每张图片的四个角点
     # 2、对图片进行变换，（单应性矩阵使）
     # 3、创建大图，将两张图拼接到一起
@@ -145,7 +166,6 @@ def stitch_image(img1, img2, H):
     # 获取根据单应性矩阵透视变换后的图像四点坐标
     img1_transform = cv2.perspectiveTransform(img1_dims, H)
     # img2_transform = cv2.perspectiveTransform(img2_dims,H)
-
     # 合并矩阵  获取最大x和最小x，最大y和最小y  根据最大最小计算合并后图像的大小；
     # #计算方式： 最大-最小
     result_dims = np.concatenate((img2_dims, img1_transform), axis=0)
@@ -166,8 +186,7 @@ def stitch_image(img1, img2, H):
     # 透视变换实现平移
     result_img = cv2.warpPerspective(img1, transform_arary.dot(H), (ww, hh))
     # 将img2添加进平移后的图像
-    result_img[transform_dist[1]:transform_dist[1] + h2,
-    transform_dist[0]:transform_dist[0] + w2] = img2
+    result_img[transform_dist[1]:transform_dist[1] + h2, transform_dist[0]:transform_dist[0] + w2] = img2
     return result_img
 
 
@@ -221,13 +240,14 @@ def onChangeW(x):
     indexW = x
 
 
-def draw_grid(img, line_num=10, color=(0, 255, 0)):
+def draw_grid(img, line_num=8, color=(0, 255, 0)):
     h, w, _ = img.shape
-    unit_h = h // line_num
+    # unit_h = h // line_num
     unit_w = w // line_num
-    for i in range(1, line_num):
+    unit_h = unit_w
+    for i in range(1, line_num * 2):
         cv2.line(img, (0, i * unit_h), (w, i * unit_h), color, thickness=2)
-    for i in range(1, line_num):
+    for i in range(line_num * 2):
         cv2.line(img, (i * unit_w, 0), (i * unit_w, h), color, thickness=2)
 
 
@@ -236,17 +256,31 @@ def main():
     # imgname2 = "imgs/拍照点3-20220412-170517.jpg"
     # imgname3 = "imgs/拍照点5-20220412-170623.jpg"
 
-    imgname1 = "imgs/拍照点2-20220412-170453.jpg"
-    imgname2 = "imgs/拍照点4-20220412-170548.jpg"
-    imgname3 = "imgs/拍照点6-20220412-170720.jpg"
+    # img_index = 3
+    # index = 3
+    # imgname1 = f"母座图片/图片{img_index}/{index}-1.jpg"
+    # imgname2 = f"母座图片/图片{img_index}/{index}-2.jpg"
+    # imgname3 = f"母座图片/图片{img_index}/{index}-3.jpg"
+
+    img_index = 1
+    index = 1
+    files = [i for i in glob(f"公座图片/图片{img_index}/拍照点{index}*")]
+    files.sort()
+    imgname1 = files[0]
+    imgname2 = files[1]
+    imgname3 = files[2]
+    #
+    # imgname1 = "imgs/拍照点2-20220412-170453.jpg"
+    # imgname2 = "imgs/拍照点4-20220412-170548.jpg"
+    # imgname3 = "imgs/拍照点6-20220412-170720.jpg"
     # 读取两张图片
     img1 = cv2.imdecode(np.fromfile(imgname1, dtype=np.uint8), 1)
     img2 = cv2.imdecode(np.fromfile(imgname2, dtype=np.uint8), 1)
     img3 = cv2.imdecode(np.fromfile(imgname3, dtype=np.uint8), 1)
 
-    img1 = resize(img1, tar_w=800)
-    img2 = resize(img2, tar_w=800)
-    img3 = resize(img3, tar_w=800)
+    img1 = resize(img1, tar_w=1200)
+    img2 = resize(img2, tar_w=1200)
+    img3 = resize(img3, tar_w=1200)
 
     img1 = rotate(img1, 0)
     img2 = rotate(img2, 0)
@@ -254,9 +288,9 @@ def main():
 
     win_name = "concat"
 
-    cv2.namedWindow(win_name)
-    cv2.createTrackbar("height", win_name, 0, 200, onChangeH)
-    cv2.createTrackbar("width", win_name, 0, 200, onChangeW)
+    # cv2.namedWindow(win_name)
+    # cv2.createTrackbar("height", win_name, 0, 200, onChangeH)
+    # cv2.createTrackbar("width", win_name, 0, 200, onChangeW)
 
     i = -1
     while True:
@@ -264,17 +298,17 @@ def main():
         img1_grid = np.copy(img1)
         img2_grid = np.copy(img2)
         img3_grid = np.copy(img3)
-        draw_grid(img1_grid, color=(0, 225, 0))
-        draw_grid(img2_grid, color=(225, 0, 0))
-        draw_grid(img3_grid, color=(0, 0, 225))
+        draw_grid(img1_grid, color=(0, 255, 0))
+        draw_grid(img2_grid, color=(255, 0, 0))
+        draw_grid(img3_grid, color=(0, 0, 255))
 
-        ransacReprojThreshold = i % 100 * 0.1
+        ransacReprojThreshold = i % 20 * 0.5
         # start = time.time()
         H, match_img1_2 = get_homo(img1, img2, ransacReprojThreshold=ransacReprojThreshold)
-        print(H.tolist()[0])
-        print(H.tolist()[1])
-        print(H.tolist()[2])
-        print()
+        # print(H.tolist()[0])
+        # print(H.tolist()[1])
+        # print(H.tolist()[2])
+        # print()
         img1_2_ = stitch_image(img1, img2, H)
         # print(time.time() - start)
         img1_2 = stitch_image(img1_grid, img2_grid, H)
@@ -292,12 +326,12 @@ def main():
         # cv2.imshow("img1", resize(img1, tar_w=500))
         # cv2.imshow("img2", resize(img2, tar_w=500))
         # cv2.imshow("img3", resize(img3, tar_w=500))
-        # cv2.imshow("match_img1_2", resize(match_img1_2, tar_w=1000))
-        # cv2.imshow("match_img2_3", resize(match_img2_3, tar_w=1000))
+        cv2.imshow("match_img1_2", resize(match_img1_2, tar_w=1200))
+        cv2.imshow("match_img2_3", resize(match_img2_3, tar_w=1000))
         result = resize(result_img, tar_w=600)
         cv2.putText(result, f"{round(ransacReprojThreshold, 3)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255))
         cv2.imshow("result", result)
-        cv2.waitKey(100)
+        cv2.waitKey(1)
 
 
 if __name__ == '__main__':
